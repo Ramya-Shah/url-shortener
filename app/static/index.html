@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>URL Shortener — Shorten, Share, Track</title>
+    <meta name="description" content="A production-grade, lightning-fast URL shortener with analytics.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <!-- Chart.js CDN for clean graphs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="background-shapes">
+        <div class="shape shape-1"></div>
+        <div class="shape shape-2"></div>
+        <div class="shape shape-3"></div>
+    </div>
+
+    <main class="container" id="mainContainer">
+
+        <!-- ── AUTH PANEL (login / register / verify-otp) ────────────────── -->
+        <div class="glass-panel" id="authPanel">
+            <header>
+                <h1>URL<span class="highlight">Shortener</span></h1>
+                <p id="authSubtitle">Sign in or create an account to continue.</p>
+            </header>
+
+            <!-- Tab switcher -->
+            <div class="tabs" id="authTabs">
+                <button class="tab-btn active" id="tabLogin" onclick="switchTab('login')">Login</button>
+                <button class="tab-btn" id="tabRegister" onclick="switchTab('register')">Register</button>
+            </div>
+
+            <!-- Login Form -->
+            <form id="loginForm" class="auth-form">
+                <div class="input-group">
+                    <label for="loginEmail">Email</label>
+                    <input type="email" id="loginEmail" placeholder="you@example.com" required>
+                </div>
+                <div class="input-group">
+                    <label for="loginPassword">Password</label>
+                    <input type="password" id="loginPassword" placeholder="••••••••" required>
+                </div>
+                <button type="submit" id="loginBtn">
+                    <span class="btn-text">Login</span>
+                    <div class="loader"></div>
+                </button>
+            </form>
+
+            <!-- Register Form -->
+            <form id="registerForm" class="auth-form hidden">
+                <div class="input-group">
+                    <label for="regEmail">Email</label>
+                    <input type="email" id="regEmail" placeholder="you@example.com" required>
+                </div>
+                <div class="input-group">
+                    <label for="regPassword">Password</label>
+                    <input type="password" id="regPassword" placeholder="Min 8 characters" required minlength="8">
+                </div>
+                <button type="submit" id="registerBtn">
+                    <span class="btn-text">Create Account</span>
+                    <div class="loader"></div>
+                </button>
+            </form>
+
+            <!-- OTP Verification Form -->
+            <form id="otpForm" class="auth-form hidden">
+                <p class="otp-info">We've sent a 6-digit code to <strong id="otpEmail"></strong>. Enter it below.</p>
+                <div class="input-group">
+                    <label for="otpCode">Verification Code</label>
+                    <input type="text" id="otpCode" placeholder="123456" maxlength="6" pattern="\d{6}" required>
+                </div>
+                <button type="submit" id="otpBtn">
+                    <span class="btn-text">Verify & Activate</span>
+                    <div class="loader"></div>
+                </button>
+            </form>
+
+            <!-- API Key Request Form (for logging in without saved API Key) -->
+            <form id="keyPromptForm" class="auth-form hidden">
+                <p class="otp-info">API key not found in this browser session. Please enter it to continue.</p>
+                <div class="input-group">
+                    <label for="inputApiKey">API Key</label>
+                    <input type="password" id="inputApiKey" placeholder="sk_••••••••••••••••" required>
+                </div>
+                <button type="submit" id="keyPromptBtn">
+                    <span class="btn-text">Proceed to Dashboard</span>
+                    <div class="loader"></div>
+                </button>
+                <button type="button" class="btn-secondary" id="btnRegenerateKey" onclick="handleRegenerateKey()">
+                    Lost your API key? Generate a new one
+                </button>
+            </form>
+
+            <!-- API Key reveal (shown once after registration) -->
+            <div id="apiKeyReveal" class="result-area hidden">
+                <h3>🎉 Account Activated!</h3>
+                <p class="api-key-warn">Save your API key — it will never be shown again.</p>
+                <div class="result-box">
+                    <code id="revealedApiKey"></code>
+                    <button id="copyApiKeyBtn" class="icon-btn" title="Copy API Key">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                    </button>
+                </div>
+                <button class="btn-secondary" onclick="proceedToDashboard()">Continue to Dashboard →</button>
+            </div>
+
+            <div id="authError" class="error-area hidden">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                <span id="authErrorMsg"></span>
+            </div>
+        </div>
+
+        <!-- ── DASHBOARD PANEL (shorten URL & list & analytics) ──────────── -->
+        <div class="glass-panel hidden" id="dashboardPanel">
+            <header>
+                <div class="brand-bar">
+                    <h1>URL<span class="highlight">Shortener</span></h1>
+                    <div class="user-bar">
+                        <span id="userEmail" class="user-email"></span>
+                        <button class="btn-logout" onclick="logout()">Logout</button>
+                    </div>
+                </div>
+            </header>
+
+            <div class="dashboard-layout">
+                <!-- Left: Shorten Form & URL list -->
+                <div class="dashboard-left">
+                    <section class="section-card">
+                        <h3>Shorten a URL</h3>
+                        <form id="shortenForm">
+                            <div class="input-group">
+                                <label for="longUrl">Destination URL</label>
+                                <input type="url" id="longUrl" placeholder="https://example.com/very/long/url" required>
+                            </div>
+
+                            <div class="input-row">
+                                <div class="input-group">
+                                    <label for="customAlias">Custom Alias <span class="optional">(Optional)</span></label>
+                                    <div class="alias-wrapper">
+                                        <span class="domain-prefix">/</span>
+                                        <input type="text" id="customAlias" placeholder="my-campaign" pattern="[a-zA-Z0-9_-]+" title="Only alphanumeric, dashes, underscores">
+                                    </div>
+                                </div>
+                                <div class="input-group">
+                                    <label for="expiresIn">Expires In <span class="optional">(Days)</span></label>
+                                    <input type="number" id="expiresIn" placeholder="Never" min="1" max="365">
+                                </div>
+                            </div>
+
+                            <button type="submit" id="submitBtn">
+                                <span class="btn-text">Shorten URL</span>
+                                <div class="loader"></div>
+                            </button>
+                        </form>
+
+                        <div id="resultArea" class="result-area hidden">
+                            <h3>Your short link is ready!</h3>
+                            <div class="result-box">
+                                <a href="#" id="shortLink" target="_blank" rel="noopener noreferrer"></a>
+                                <button id="copyBtn" class="icon-btn" title="Copy to clipboard">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div id="errorArea" class="error-area hidden">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                            <span id="errorMessage"></span>
+                        </div>
+                    </section>
+
+                    <section class="section-card" style="margin-top: 25px;">
+                        <div class="section-header">
+                            <h3>My Shortened Links</h3>
+                            <button class="btn-refresh" onclick="fetchUserUrls()" title="Refresh List">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+                            </button>
+                        </div>
+                        <div class="urls-list-container">
+                            <div id="urlsListEmpty" class="list-empty">
+                                No shortened links yet. Create one above!
+                            </div>
+                            <div id="urlsList" class="urls-list">
+                                <!-- URL items dynamically inserted -->
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Right: Real-Time Analytics -->
+                <div class="dashboard-right">
+                    <section class="section-card analytics-card">
+                        <h3>Analytics Dashboard</h3>
+                        
+                        <div id="analyticsPlaceholder" class="analytics-placeholder">
+                            <div class="placeholder-icon">📈</div>
+                            <p>Select a short link from the left to view detailed real-time statistics.</p>
+                        </div>
+                        
+                        <div id="analyticsContent" class="analytics-content hidden">
+                            <div class="active-link-info">
+                                <div class="title-row">
+                                    <h4 id="activeShortCode">/xyz</h4>
+                                    <span id="activeStatus" class="status-badge">Active</span>
+                                </div>
+                                <p id="activeLongUrl" class="truncated-text">https://example.com/long/url</p>
+                                <div class="date-row">
+                                    <span id="activeUrlCreated" class="meta-date">Created May 19, 2026</span>
+                                    <span id="activeUrlExpires" class="meta-date"></span>
+                                </div>
+                            </div>
+
+                            <div class="stats-grid">
+                                <div class="stat-box">
+                                    <span class="stat-val" id="statTotalClicks">0</span>
+                                    <span class="stat-label">Total Clicks</span>
+                                </div>
+                                <div class="stat-box">
+                                    <span class="stat-val" id="statUniqueIps">0</span>
+                                    <span class="stat-label">Unique Visitors</span>
+                                </div>
+                            </div>
+
+                            <div class="chart-container">
+                                <h5>Clicks (Last 30 Days)</h5>
+                                <div class="chart-wrapper">
+                                    <canvas id="clicksChart"></canvas>
+                                </div>
+                            </div>
+
+                            <div class="breakdown-grid">
+                                <div class="breakdown-box">
+                                    <h5>Top Referrers</h5>
+                                    <div id="breakdownReferrers" class="breakdown-list">
+                                        <!-- dynamic referrers -->
+                                    </div>
+                                </div>
+                                <div class="breakdown-box">
+                                    <h5>Top Countries</h5>
+                                    <div id="breakdownCountries" class="breakdown-list">
+                                        <!-- dynamic countries -->
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

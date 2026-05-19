@@ -1,0 +1,23 @@
+# Environment variables (secret credentials)
+.env
+
+# Celery Beat state files
+celerybeat-schedule
+celerybeat-schedule.db
+celerybeat-schedule.dir
+celerybeat-schedule.bak
+
+# Python cache & compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE / System files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

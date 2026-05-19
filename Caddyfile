@@ -1,0 +1,9 @@
+# Replace with your actual DuckDNS subdomain (e.g. my-shortener.duckdns.org)
+{env.DOMAIN_NAME} {
+    tls {
+        dns duckdns {env.DUCKDNS_TOKEN}
+    }
+
+    # Reverse proxy incoming requests to the FastAPI app container
+    reverse_proxy app:8000
+}
