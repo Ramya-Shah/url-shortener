@@ -33,7 +33,13 @@ async def redirect_to_long_url(
         long_url = url_obj.long_url
         await cache.set_long_url(code, long_url, ttl_seconds=3600)
     
-    client_ip = request.client.host if request.client else None
+    # Use X-Forwarded-For to get real IP behind Caddy reverse proxy
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else None
+        
     user_agent = request.headers.get("user-agent")
     referer = request.headers.get("referer")
     
