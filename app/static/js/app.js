@@ -1,9 +1,11 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 let pendingEmail = '';      // email waiting for OTP verification
 let sessionApiKey = '';     // plain-text key held only for the current session
-let clicksChartInstance = null;
 let selectedShortCode = null;
-let userUrls = [];          // local cache of user's shortened links
+let freshCode = null;       // code created this session, animated into the rail
+let userUrls = [];
+
+const TILE_COLORS = ['#7A1F45', '#1F3E7A', '#1C5E4C', '#6A4A16', '#3E2A6E', '#6B2A1A', '#14566B', '#4D5A1A', '#5E1F66', '#2B4A63'];
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -14,23 +16,74 @@ function setLoading(btn, loading) {
 }
 
 function showError(areaId, msgId, message) {
-    $(areaId).classList.remove('hidden');
     $(msgId).textContent = message;
+    $(areaId).classList.remove('hidden');
 }
 
 function hideError(areaId) {
     $(areaId).classList.add('hidden');
 }
 
-function copyToClipboard(text, btn) {
-    navigator.clipboard.writeText(text).then(() => {
-        const orig = btn.innerHTML;
-        btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--success)"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
-        setTimeout(() => { btn.innerHTML = orig; }, 2000);
-    });
+// FastAPI returns `detail` as a string or as a list of validation errors.
+function errorText(data, fallback) {
+    if (!data || !data.detail) return fallback;
+    if (typeof data.detail === 'string') return data.detail;
+    if (Array.isArray(data.detail)) {
+        return data.detail.map(d => {
+            const field = (d.loc || []).slice(-1)[0];
+            if (field === 'custom_alias') return 'Alias must be 4 to 20 characters.';
+            if (field === 'long_url') return 'That doesn\'t look like a valid URL. Include https://';
+            if (field === 'expires_in_days') return 'Expiry must be a whole number of days, 1 or more.';
+            return d.msg;
+        }).join(' ');
+    }
+    return fallback;
 }
 
-// ── Tab switching ─────────────────────────────────────────────────────────────
+async function readJson(res) {
+    try { return await res.json(); } catch { return null; }
+}
+
+let toastTimer;
+function toast(msg) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.add('on');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
+}
+
+function copyText(text, onDone) {
+    navigator.clipboard.writeText(text).then(onDone, () => toast('Copy failed. Select the text and copy it manually.'));
+}
+
+function tileColor(code) {
+    let h = 0;
+    for (const ch of code) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    return TILE_COLORS[h % TILE_COLORS.length];
+}
+
+function fmtDate(iso, opts = { day: 'numeric', month: 'short', year: 'numeric' }) {
+    return new Date(iso).toLocaleDateString('en-GB', opts);
+}
+
+function prettyUrl(u) {
+    return u.replace(/^https?:\/\//, '').replace(/\/$/, '');
+}
+
+function hostOf(ref) {
+    try { return new URL(ref).hostname.replace(/^www\./, ''); } catch { return ref; }
+}
+
+function isExpired(url) {
+    return !url.is_active || (url.expires_at && new Date(url.expires_at) < new Date());
+}
+
+function authHeaders(extra = {}) {
+    return { 'Accept': 'application/json', 'X-API-Key': sessionApiKey, ...extra };
+}
+
+// ── Auth: tabs ────────────────────────────────────────────────────────────────
 window.switchTab = (tab) => {
     $('loginForm').classList.toggle('hidden', tab !== 'login');
     $('registerForm').classList.toggle('hidden', tab !== 'register');
@@ -39,42 +92,35 @@ window.switchTab = (tab) => {
     $('keyPromptForm').classList.add('hidden');
     hideError('authError');
     $('authTabs').classList.remove('hidden');
-    $('tabLogin').classList.toggle('active', tab === 'login');
-    $('tabRegister').classList.toggle('active', tab === 'register');
+    $('tabLogin').setAttribute('aria-selected', tab === 'login');
+    $('tabRegister').setAttribute('aria-selected', tab === 'register');
     $('authSubtitle').textContent = tab === 'login'
-        ? 'Sign in or create an account to continue.'
-        : 'Create your free account.';
+        ? 'Welcome back. Log in to see your links.'
+        : 'Free account. We\'ll email you a code to confirm it.';
 };
 
-// ── Auth Panel: Login ─────────────────────────────────────────────────────────
+// ── Auth: login ───────────────────────────────────────────────────────────────
 $('loginForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     hideError('authError');
     const btn = $('loginBtn');
     setLoading(btn, true);
     try {
+        const email = $('loginEmail').value;
         const res = await fetch('/auth/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                email: $('loginEmail').value,
-                password: $('loginPassword').value,
-            }),
+            body: JSON.stringify({ email, password: $('loginPassword').value }),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Login failed.');
+        const data = await readJson(res);
+        if (!res.ok) throw new Error(errorText(data, 'Login failed. Check your email and password.'));
 
-        // Store JWT in sessionStorage (cleared when tab closes)
         sessionStorage.setItem('jwt', data.access_token);
-        sessionStorage.setItem('email', $('loginEmail').value);
+        sessionStorage.setItem('email', email);
 
-        // Check if API key is cached locally, otherwise prompt
         const savedKey = sessionStorage.getItem('apiKey');
-        if (savedKey) {
-            showDashboard($('loginEmail').value, savedKey);
-        } else {
-            promptForApiKey($('loginEmail').value);
-        }
+        if (savedKey) showDashboard(email, savedKey);
+        else promptForApiKey();
     } catch (err) {
         showError('authError', 'authErrorMsg', err.message);
     } finally {
@@ -82,7 +128,7 @@ $('loginForm').addEventListener('submit', async (e) => {
     }
 });
 
-// ── Auth Panel: Register ──────────────────────────────────────────────────────
+// ── Auth: register ────────────────────────────────────────────────────────────
 $('registerForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     hideError('authError');
@@ -95,17 +141,16 @@ $('registerForm').addEventListener('submit', async (e) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ email, password: $('regPassword').value }),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Registration failed.');
+        const data = await readJson(res);
+        if (!res.ok) throw new Error(errorText(data, 'Couldn\'t create the account. Try again.'));
 
-        // Switch to OTP form
         pendingEmail = email;
         $('registerForm').classList.add('hidden');
-        $('loginForm').classList.add('hidden');
         $('authTabs').classList.add('hidden');
         $('otpEmail').textContent = email;
         $('otpForm').classList.remove('hidden');
-        $('authSubtitle').textContent = 'Check your email for the verification code.';
+        $('authSubtitle').textContent = 'One more step: confirm your email.';
+        $('otpCode').focus();
     } catch (err) {
         showError('authError', 'authErrorMsg', err.message);
     } finally {
@@ -113,7 +158,7 @@ $('registerForm').addEventListener('submit', async (e) => {
     }
 });
 
-// ── Auth Panel: OTP Verify ────────────────────────────────────────────────────
+// ── Auth: verify code ─────────────────────────────────────────────────────────
 $('otpForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     hideError('authError');
@@ -125,19 +170,14 @@ $('otpForm').addEventListener('submit', async (e) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ email: pendingEmail, otp: $('otpCode').value }),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'OTP verification failed.');
+        const data = await readJson(res);
+        if (!res.ok) throw new Error(errorText(data, 'That code didn\'t work. Check it and try again.'));
 
-        // Store the plain-text API key for this session
         sessionApiKey = data.api_key;
         sessionStorage.setItem('apiKey', data.api_key);
         sessionStorage.setItem('email', data.email);
-
-        // Show the API key reveal
-        $('otpForm').classList.add('hidden');
-        $('revealedApiKey').textContent = data.api_key;
-        $('apiKeyReveal').classList.remove('hidden');
-        $('authSubtitle').textContent = 'Save your API key now!';
+        showKeyReveal(data.api_key, 'Account activated',
+            'This is your API key. Copy it somewhere safe: it is shown only once.');
     } catch (err) {
         showError('authError', 'authErrorMsg', err.message);
     } finally {
@@ -145,23 +185,31 @@ $('otpForm').addEventListener('submit', async (e) => {
     }
 });
 
-// ── Copy API Key button ───────────────────────────────────────────────────────
+function showKeyReveal(key, title, note) {
+    ['otpForm', 'keyPromptForm', 'loginForm', 'registerForm', 'authTabs'].forEach(id => $(id).classList.add('hidden'));
+    $('revealTitle').textContent = title;
+    $('revealNote').textContent = note;
+    $('revealedApiKey').textContent = key;
+    $('apiKeyReveal').classList.remove('hidden');
+    $('authSubtitle').textContent = 'Save your key before you continue.';
+}
+
 $('copyApiKeyBtn').addEventListener('click', () => {
-    copyToClipboard($('revealedApiKey').textContent, $('copyApiKeyBtn'));
+    copyText($('revealedApiKey').textContent, () => toast('API key copied'));
 });
 
-// ── Proceed to dashboard after registration ───────────────────────────────────
 window.proceedToDashboard = () => {
     showDashboard(sessionStorage.getItem('email'), sessionApiKey);
 };
 
-// ── If logged-in returning user has no API key in session, show DOM key prompt
-function promptForApiKey(email) {
+// ── Auth: API key prompt (key not in this browser) ───────────────────────────
+function promptForApiKey() {
     $('loginForm').classList.add('hidden');
     $('authTabs').classList.add('hidden');
     $('keyPromptForm').classList.remove('hidden');
-    $('authSubtitle').textContent = 'API Key required to access dashboard.';
+    $('authSubtitle').textContent = 'Logged in. One more thing:';
     $('inputApiKey').value = '';
+    $('inputApiKey').focus();
 }
 
 $('keyPromptForm').addEventListener('submit', async (e) => {
@@ -169,26 +217,12 @@ $('keyPromptForm').addEventListener('submit', async (e) => {
     hideError('authError');
     const btn = $('keyPromptBtn');
     setLoading(btn, true);
-    
     const key = $('inputApiKey').value.trim();
-    const email = sessionStorage.getItem('email');
-    
     try {
-        // Verify key by calling /urls
-        const res = await fetch('/urls', {
-            method: 'GET',
-            headers: {
-                'Accept': 'application/json',
-                'X-API-Key': key
-            }
-        });
-        if (!res.ok) {
-            throw new Error("Invalid API key. Please check the key you entered.");
-        }
-        
-        // Key is valid! Save and go to dashboard
+        const res = await fetch('/urls', { headers: { 'Accept': 'application/json', 'X-API-Key': key } });
+        if (!res.ok) throw new Error('That API key wasn\'t accepted. Check it, or generate a new one below.');
         sessionStorage.setItem('apiKey', key);
-        showDashboard(email, key);
+        showDashboard(sessionStorage.getItem('email'), key);
     } catch (err) {
         showError('authError', 'authErrorMsg', err.message);
     } finally {
@@ -199,370 +233,234 @@ $('keyPromptForm').addEventListener('submit', async (e) => {
 window.handleRegenerateKey = async () => {
     hideError('authError');
     const btn = $('btnRegenerateKey');
+    const original = btn.textContent;
     btn.disabled = true;
-    const originalText = btn.textContent;
-    btn.textContent = 'Regenerating...';
-    
-    const jwt = sessionStorage.getItem('jwt');
-    const email = sessionStorage.getItem('email');
-    
+    btn.textContent = 'Generating…';
     try {
         const res = await fetch('/auth/regenerate-key', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${jwt}`
-            }
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionStorage.getItem('jwt')}` },
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Regeneration failed.');
-        
-        // Save the new key for the session
+        const data = await readJson(res);
+        if (!res.ok) throw new Error(errorText(data, 'Couldn\'t generate a new key. Log in again and retry.'));
         sessionApiKey = data.api_key;
         sessionStorage.setItem('apiKey', data.api_key);
-        
-        // Reset forms
-        $('keyPromptForm').classList.add('hidden');
-        
-        // Update reveal area headers for regeneration flow
-        $('apiKeyReveal').querySelector('h3').textContent = '🎉 New API Key Generated!';
-        $('apiKeyReveal').querySelector('.api-key-warn').textContent = 'Save your new API key — your old key is now invalidated.';
-        $('revealedApiKey').textContent = data.api_key;
-        $('apiKeyReveal').classList.remove('hidden');
-        $('authSubtitle').textContent = 'Save your new API key now!';
+        showKeyReveal(data.api_key, 'New API key',
+            'Your old key no longer works. Copy this one somewhere safe: it is shown only once.');
     } catch (err) {
         showError('authError', 'authErrorMsg', err.message);
     } finally {
         btn.disabled = false;
-        btn.textContent = originalText;
+        btn.textContent = original;
     }
 };
 
-// ── Show the dashboard panel ──────────────────────────────────────────────────
+// ── Dashboard ─────────────────────────────────────────────────────────────────
 function showDashboard(email, apiKey) {
     sessionApiKey = apiKey;
     $('authPanel').classList.add('hidden');
     $('dashboardPanel').classList.remove('hidden');
-    $('mainContainer').classList.add('dashboard-active');
-    $('userEmail').textContent = email;
-    
-    // Initial fetch of URLs
+    $('userEmail').textContent = email || '';
+    $('urlsList').innerHTML = '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
     fetchUserUrls();
 }
 
-// ── Fetch URLs created by user ────────────────────────────────────────────────
 window.fetchUserUrls = async () => {
     try {
-        const res = await fetch('/urls', {
-            method: 'GET',
-            cache: 'no-cache',
-            headers: {
-                'Accept': 'application/json',
-                'X-API-Key': sessionApiKey
-            }
-        });
+        const res = await fetch('/urls', { cache: 'no-cache', headers: authHeaders() });
         if (!res.ok) {
-            if (res.status === 401) {
-                // API Key expired or invalid
-                sessionStorage.removeItem('apiKey');
-                logout();
-                return;
-            }
-            throw new Error('Failed to load shortened links.');
+            if (res.status === 401) { sessionStorage.removeItem('apiKey'); logout(); return; }
+            throw new Error('Couldn\'t load your links. Refresh to try again.');
         }
         userUrls = await res.json();
-        renderUrlsList(userUrls);
+        userUrls.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        renderRails();
 
-        // Refresh active selection if there is one, otherwise auto-select first link
-        if (selectedShortCode) {
-            const activeUrlObj = userUrls.find(u => u.short_code === selectedShortCode);
-            if (activeUrlObj) {
-                selectUrl(activeUrlObj);
-            }
-        } else if (userUrls.length > 0) {
-            selectUrl(userUrls[0]);
-        }
+        const current = userUrls.find(u => u.short_code === selectedShortCode);
+        const firstLive = userUrls.find(u => !isExpired(u)) || userUrls[0];
+        if (current) selectUrl(current, false);
+        else if (firstLive) selectUrl(firstLive, false);
+        else $('show').classList.add('empty');
     } catch (err) {
-        console.error("Error fetching URLs:", err);
+        showError('errorArea', 'errorMessage', err.message);
     }
 };
 
-// ── Render URLs in the list ───────────────────────────────────────────────────
-function renderUrlsList(urls) {
-    const list = $('urlsList');
-    const emptyMsg = $('urlsListEmpty');
-    list.innerHTML = '';
-    
-    if (urls.length === 0) {
-        emptyMsg.classList.remove('hidden');
-        return;
-    }
-    
-    emptyMsg.classList.add('hidden');
+function renderRails() {
+    const live = userUrls.filter(u => !isExpired(u));
+    const expired = userUrls.filter(isExpired);
+
+    $('show').classList.toggle('empty', userUrls.length === 0);
+    $('analyticsPlaceholder').classList.toggle('hidden', userUrls.length !== 0);
+
+    $('activeCount').textContent = live.length ? `${live.length} active` : '';
+    $('urlsListEmpty').classList.toggle('hidden', live.length !== 0);
+    fillRail($('urlsList'), live);
+
+    $('expiredWrap').classList.toggle('hidden', expired.length === 0);
+    $('expiredCount').textContent = `${expired.length} link${expired.length === 1 ? '' : 's'}`;
+    fillRail($('expiredList'), expired);
+    freshCode = null;
+}
+
+function fillRail(rail, urls) {
+    rail.innerHTML = '';
     urls.forEach(url => {
-        const item = document.createElement('div');
-        item.className = 'url-item';
-        if (selectedShortCode === url.short_code) {
-            item.classList.add('selected');
-        }
-        
-        const createdDate = new Date(url.created_at).toLocaleDateString(undefined, {
-            month: 'short',
-            day: 'numeric'
-        });
-        
-        item.innerHTML = `
-            <div class="url-info-left">
-                <span class="url-code">/${url.short_code}</span>
-                <span class="url-long" title="${url.long_url}">${url.long_url}</span>
-                <span class="url-meta">Created ${createdDate}</span>
-            </div>
-            <div class="url-info-right">
-                <span class="clicks-badge">${url.clicks_count} clicks</span>
-            </div>
-        `;
-        
-        item.addEventListener('click', () => {
-            // Remove previous selections
-            document.querySelectorAll('.url-item').forEach(el => el.classList.remove('selected'));
-            item.classList.add('selected');
-            selectUrl(url);
-        });
-        
-        list.appendChild(item);
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'tile';
+        b.setAttribute('role', 'listitem');
+        b.dataset.code = url.short_code;
+        b.style.setProperty('--tile', isExpired(url) ? '#3A3D45' : tileColor(url.short_code));
+        b.setAttribute('aria-pressed', url.short_code === selectedShortCode);
+        if (url.short_code === freshCode) b.classList.add('fresh');
+
+        const top = document.createElement('span');
+        top.className = 't-top num';
+        const right = isExpired(url)
+            ? (url.expires_at ? `Ended ${fmtDate(url.expires_at, { day: 'numeric', month: 'short' })}` : 'Inactive')
+            : fmtDate(url.created_at, { day: 'numeric', month: 'short' });
+        top.innerHTML = `<span>${url.clicks_count} click${url.clicks_count === 1 ? '' : 's'}</span><span></span>`;
+        top.lastChild.textContent = right;
+
+        const code = document.createElement('span');
+        code.className = 't-code';
+        code.textContent = '/' + url.short_code;
+
+        const dest = document.createElement('span');
+        dest.className = 't-dest';
+        dest.textContent = prettyUrl(url.long_url);
+        b.title = url.long_url;
+
+        b.append(top, code, dest);
+        b.addEventListener('click', () => selectUrl(url, true));
+        rail.appendChild(b);
     });
 }
 
-// ── Select a URL to load its detailed stats ──────────────────────────────────
-async function selectUrl(url) {
+async function selectUrl(url, animate) {
     selectedShortCode = url.short_code;
-    
-    // UI elements update
+    document.querySelectorAll('.rail .tile').forEach(t => t.setAttribute('aria-pressed', t.dataset.code === url.short_code));
+
+    const show = $('show');
+    show.classList.remove('empty');
     $('analyticsPlaceholder').classList.add('hidden');
-    $('analyticsContent').classList.remove('hidden');
-    
-    $('activeShortCode').textContent = `/${url.short_code}`;
-    $('activeLongUrl').textContent = url.long_url;
-    
-    const createdDate = new Date(url.created_at).toLocaleDateString(undefined, {
-        month: 'long',
-        day: 'numeric',
-        year: 'numeric'
-    });
-    $('activeUrlCreated').textContent = `Created ${createdDate}`;
-    
-    if (url.expires_at) {
-        const expDate = new Date(url.expires_at).toLocaleDateString(undefined, {
-            month: 'long',
-            day: 'numeric',
-            year: 'numeric'
-        });
-        $('activeUrlExpires').textContent = `• Expires ${expDate}`;
-    } else {
-        $('activeUrlExpires').textContent = '• Never Expires';
-    }
-    
-    // Toggle active status UI
-    const statusBadge = $('activeStatus');
-    if (url.is_active) {
-        statusBadge.textContent = "Active";
-        statusBadge.style.borderColor = "var(--success)";
-        statusBadge.style.color = "var(--success)";
-        statusBadge.style.background = "rgba(16, 185, 129, 0.1)";
-    } else {
-        statusBadge.textContent = "Inactive";
-        statusBadge.style.borderColor = "var(--danger)";
-        statusBadge.style.color = "var(--danger)";
-        statusBadge.style.background = "rgba(239, 68, 68, 0.1)";
-    }
-    
-    // Load statistics
+    show.style.setProperty('--tile', isExpired(url) ? '#3A3D45' : tileColor(url.short_code));
+    if (animate) { show.classList.remove('swap'); void show.offsetWidth; show.classList.add('swap'); }
+
+    $('activeShortCode').textContent = '/' + url.short_code;
+    const dest = $('activeLongUrl');
+    dest.textContent = prettyUrl(url.long_url);
+    dest.href = url.long_url;
+    dest.title = url.long_url;
+    $('openShort').href = url.short_url;
+    $('copyBtn').dataset.url = url.short_url;
+
+    const status = $('activeStatus');
+    const expired = isExpired(url);
+    status.textContent = expired ? 'Expired' : 'Live';
+    status.classList.toggle('off', expired);
+    $('activeUrlCreated').textContent = `Created ${fmtDate(url.created_at)}`;
+    $('activeUrlExpires').textContent = url.expires_at
+        ? `${expired ? 'Expired' : 'Expires'} ${fmtDate(url.expires_at)}`
+        : 'Never expires';
+
     await fetchStats(url.short_code);
 }
 
-// ── Fetch statistics from backend ─────────────────────────────────────────────
 async function fetchStats(code) {
     try {
-        const res = await fetch(`/stats/${code}`, {
-            method: 'GET',
-            cache: 'no-cache',
-            headers: {
-                'Accept': 'application/json',
-                'X-API-Key': sessionApiKey
-            }
-        });
-        if (!res.ok) throw new Error("Failed to load statistics.");
+        const res = await fetch(`/stats/${encodeURIComponent(code)}`, { cache: 'no-cache', headers: authHeaders() });
+        if (!res.ok) throw new Error('Couldn\'t load stats for this link.');
         const data = await res.json();
-        
+        if (code !== selectedShortCode) return; // user moved on
+
         $('statTotalClicks').textContent = data.total_clicks;
         $('statUniqueIps').textContent = data.unique_ips;
-        
-        renderChart(data.clicks_by_day);
-        renderBreakdowns(data.top_referrers, data.top_countries);
+        const topRef = data.top_referrers && data.top_referrers[0];
+        const topCountry = data.top_countries && data.top_countries[0];
+        $('statTopRef').textContent = topRef ? hostOf(topRef.referrer) : 'None yet';
+        $('statTopCountry').textContent = topCountry ? topCountry.country : 'None yet';
+        $('statTopRef').title = $('statTopRef').textContent;
+
+        renderBars(data.clicks_by_day || {});
+        renderList($('breakdownReferrers'), data.top_referrers, 'referrer', 'No referrers yet');
+        renderList($('breakdownCountries'), data.top_countries, 'country', 'No countries yet');
     } catch (err) {
-        console.error("Error loading stats:", err);
+        showError('errorArea', 'errorMessage', err.message);
     }
 }
 
-// ── Render Chart.js line graph ────────────────────────────────────────────────
-function renderChart(clicksByDay) {
-    const ctx = $('clicksChart').getContext('2d');
-    
-    // Sort keys chronologically
-    const sortedDays = Object.keys(clicksByDay).sort();
-    const clickCounts = sortedDays.map(day => clicksByDay[day]);
-    
-    // Format labels for readable display
-    const formattedLabels = sortedDays.map(dayStr => {
-        const date = new Date(dayStr);
-        return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-    });
-    
-    if (clicksChartInstance) {
-        clicksChartInstance.destroy();
+function dayKey(d) {
+    return d.toISOString().slice(0, 10);
+}
+
+function renderBars(byDay) {
+    const days = [];
+    const today = new Date();
+    for (let i = 29; i >= 0; i--) {
+        const d = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - i));
+        days.push({ d, n: byDay[dayKey(d)] || 0 });
     }
-    
-    clicksChartInstance = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: formattedLabels,
-            datasets: [{
-                label: 'Clicks',
-                data: clickCounts,
-                borderColor: '#f59e0b',
-                backgroundColor: 'rgba(245, 158, 11, 0.1)',
-                borderWidth: 2.5,
-                fill: true,
-                tension: 0.35,
-                pointBackgroundColor: '#f59e0b',
-                pointRadius: 3
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: { display: false },
-                tooltip: {
-                    callbacks: {
-                        title: (items) => {
-                            const index = items[0].dataIndex;
-                            const fullDate = new Date(sortedDays[index]);
-                            return fullDate.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
-                        }
-                    }
-                }
-            },
-            scales: {
-                x: {
-                    grid: { color: 'rgba(241, 226, 209, 0.05)' },
-                    ticks: { color: '#DCC3AA', font: { family: 'Outfit', size: 10 } }
-                },
-                y: {
-                    beginAtZero: true,
-                    grid: { color: 'rgba(241, 226, 209, 0.05)' },
-                    ticks: { 
-                        color: '#DCC3AA', 
-                        font: { family: 'Outfit', size: 10 },
-                        precision: 0
-                    }
-                }
-            }
-        }
+    const max = Math.max(1, ...days.map(x => x.n));
+    const peakN = Math.max(...days.map(x => x.n));
+    const peakIdx = peakN > 0 ? days.map(x => x.n).lastIndexOf(peakN) : -1;
+
+    const bars = $('bars');
+    bars.innerHTML = '';
+    days.forEach((x, i) => {
+        const bar = document.createElement('i');
+        bar.style.height = (x.n / max * 100) + '%';
+        bar.title = `${fmtDate(x.d, { day: 'numeric', month: 'short' })}: ${x.n} click${x.n === 1 ? '' : 's'}`;
+        if (i === peakIdx) bar.className = 'peak';
+        bars.appendChild(bar);
+    });
+
+    const short = { day: 'numeric', month: 'short' };
+    $('axisStart').textContent = fmtDate(days[0].d, short);
+    $('axisEnd').textContent = 'Today';
+    $('chartPeak').textContent = peakIdx >= 0 ? `Peak ${peakN} on ${fmtDate(days[peakIdx].d, short)}` : 'No clicks yet';
+}
+
+function renderList(ol, rows, key, emptyText) {
+    ol.innerHTML = '';
+    if (!rows || rows.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'none';
+        li.textContent = emptyText;
+        ol.appendChild(li);
+        return;
+    }
+    rows.forEach(r => {
+        const li = document.createElement('li');
+        const name = document.createElement('span');
+        name.textContent = key === 'referrer' ? hostOf(r[key]) : r[key];
+        name.title = r[key];
+        const n = document.createElement('b');
+        n.textContent = r.count;
+        li.append(name, n);
+        ol.appendChild(li);
     });
 }
 
-// ── Render Country & Referrer progress-bar lists ──────────────────────────────
-function renderBreakdowns(referrers, countries) {
-    const refList = $('breakdownReferrers');
-    const countryList = $('breakdownCountries');
-    
-    refList.innerHTML = '';
-    countryList.innerHTML = '';
-    
-    // Render referrers
-    if (!referrers || referrers.length === 0) {
-        refList.innerHTML = '<div class="list-empty" style="padding: 10px 0;">No referrers yet.</div>';
-    } else {
-        const maxClicks = Math.max(...referrers.map(r => r.count), 1);
-        referrers.forEach(r => {
-            const pct = (r.count / maxClicks) * 100;
-            const item = document.createElement('div');
-            item.className = 'breakdown-item';
-            item.innerHTML = `
-                <div class="breakdown-fill" style="width: ${pct}%"></div>
-                <span class="breakdown-name">${r.referrer}</span>
-                <span class="breakdown-count">${r.count}</span>
-            `;
-            refList.appendChild(item);
-        });
-    }
-    
-    // Render countries
-    if (!countries || countries.length === 0) {
-        countryList.innerHTML = '<div class="list-empty" style="padding: 10px 0;">No countries yet.</div>';
-    } else {
-        const maxClicks = Math.max(...countries.map(c => c.count), 1);
-        countries.forEach(c => {
-            const pct = (c.count / maxClicks) * 100;
-            const item = document.createElement('div');
-            item.className = 'breakdown-item';
-            item.innerHTML = `
-                <div class="breakdown-fill" style="width: ${pct}%"></div>
-                <span class="breakdown-name">${c.country}</span>
-                <span class="breakdown-count">${c.count}</span>
-            `;
-            countryList.appendChild(item);
-        });
-    }
-}
+// ── Copy short link ───────────────────────────────────────────────────────────
+$('copyBtn').addEventListener('click', () => {
+    const btn = $('copyBtn');
+    copyText(btn.dataset.url, () => {
+        btn.classList.add('done');
+        $('copyLabel').textContent = 'Copied';
+        setTimeout(() => { btn.classList.remove('done'); $('copyLabel').textContent = 'Copy short link'; }, 1800);
+    });
+});
 
-// ── Logout ────────────────────────────────────────────────────────────────────
-window.logout = () => {
-    sessionStorage.clear();
-    sessionApiKey = '';
-    selectedShortCode = null;
-    userUrls = [];
-    
-    if (clicksChartInstance) {
-        clicksChartInstance.destroy();
-        clicksChartInstance = null;
-    }
-    
-    $('dashboardPanel').classList.add('hidden');
-    $('authPanel').classList.remove('hidden');
-    $('mainContainer').classList.remove('dashboard-active');
-    
-    $('loginEmail').value = '';
-    $('loginPassword').value = '';
-    
-    // Reset analytics views
-    $('analyticsContent').classList.add('hidden');
-    $('analyticsPlaceholder').classList.remove('hidden');
-    $('resultArea').classList.add('hidden');
-    $('errorArea').classList.add('hidden');
-    
-    switchTab('login');
-};
-
-// ── On page load: check if already "logged in" for this session ───────────────
-(function init() {
-    const email = sessionStorage.getItem('email');
-    const apiKey = sessionStorage.getItem('apiKey');
-    if (email && apiKey) {
-        showDashboard(email, apiKey);
-    }
-})();
-
-// ── Dashboard: Shorten URL ────────────────────────────────────────────────────
+// ── Shorten ───────────────────────────────────────────────────────────────────
 $('shortenForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    $('resultArea').classList.add('hidden');
-    $('errorArea').classList.add('hidden');
+    hideError('errorArea');
     const btn = $('submitBtn');
     setLoading(btn, true);
 
-    const payload = { long_url: $('longUrl').value };
+    const payload = { long_url: $('longUrl').value.trim() };
     const alias = $('customAlias').value.trim();
     const expires = $('expiresIn').value;
     if (alias) payload.custom_alias = alias;
@@ -571,29 +469,19 @@ $('shortenForm').addEventListener('submit', async (e) => {
     try {
         const res = await fetch('/shorten', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'X-API-Key': sessionApiKey,
-            },
+            headers: authHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify(payload),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Failed to shorten URL.');
+        const data = await readJson(res);
+        if (!res.ok) throw new Error(errorText(data, 'Couldn\'t shorten that URL. Try again.'));
 
-        // Show result box
-        $('shortLink').href = data.short_url;
-        $('shortLink').textContent = data.short_url;
-        $('resultArea').classList.remove('hidden');
-        
-        // Reset form inputs
         $('longUrl').value = '';
         $('customAlias').value = '';
         $('expiresIn').value = '';
-        
-        // Auto-refresh list and select the newly created URL
         selectedShortCode = data.short_code;
+        freshCode = data.short_code;
         await fetchUserUrls();
+        copyText(data.short_url, () => toast(`/${data.short_code} created and copied`));
     } catch (err) {
         showError('errorArea', 'errorMessage', err.message);
     } finally {
@@ -601,7 +489,23 @@ $('shortenForm').addEventListener('submit', async (e) => {
     }
 });
 
-// ── Copy short URL button ─────────────────────────────────────────────────────
-$('copyBtn').addEventListener('click', () => {
-    copyToClipboard($('shortLink').href, $('copyBtn'));
-});
+// ── Logout ────────────────────────────────────────────────────────────────────
+window.logout = () => {
+    sessionStorage.clear();
+    sessionApiKey = '';
+    selectedShortCode = null;
+    userUrls = [];
+    $('dashboardPanel').classList.add('hidden');
+    $('authPanel').classList.remove('hidden');
+    $('loginEmail').value = '';
+    $('loginPassword').value = '';
+    hideError('errorArea');
+    switchTab('login');
+};
+
+// ── Restore session on load ───────────────────────────────────────────────────
+(function init() {
+    const email = sessionStorage.getItem('email');
+    const apiKey = sessionStorage.getItem('apiKey');
+    if (email && apiKey) showDashboard(email, apiKey);
+})();
