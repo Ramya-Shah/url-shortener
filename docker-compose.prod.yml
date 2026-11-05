@@ -69,6 +69,7 @@ services:
       redis:
         condition: service_healthy
     environment:
+      - DATABASE_URL=postgresql+asyncpg://shortener:${POSTGRES_PASSWORD}@postgres:5432/shortener_db
       - REDIS_URL=redis://redis:6379/0
     restart: always
 
